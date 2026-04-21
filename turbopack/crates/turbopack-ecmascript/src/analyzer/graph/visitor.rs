@@ -1770,7 +1770,7 @@ impl VisitAstPath for Analyzer<'_> {
 
         // If this identifier is free, produce an effect so we can potentially replace it later.
         if self.analyze_mode.is_code_gen()
-            && let JsValue::FreeVar(var) = self.eval_context.eval_ident(ident)
+            && let JsValue::FreeVar(var) = self.eval_context.eval_id(ident.to_id())
         {
             // TODO(lukesandberg): we should consider filtering effects here, e.g. there is no
             // benefit in an Effect for `window` or `Math`

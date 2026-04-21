@@ -129,7 +129,7 @@ pub enum JsValue {
     Object {
         total_nodes: u32,
         parts: Vec<ObjectPart>,
-        mutable: bool,
+        mutability: ObjectMutability,
     },
     /// A list of alternative values
     Alternatives {
@@ -530,7 +530,7 @@ impl TryFrom<&CompileTimeDefineValue> for JsValue {
                             ))
                         })
                         .collect::<Result<Vec<_>>>()?,
-                    mutable: false,
+                    mutability: ObjectMutability::Frozen,
                 };
                 js_value.update_total_nodes();
                 return Ok(js_value);
@@ -802,11 +802,11 @@ impl JsValue {
                 })
                 .sum::<u32>(),
             parts: list,
-            mutable: true,
+            mutability: ObjectMutability::Mutable,
         }
     }
 
-    pub fn frozen_object(list: Vec<ObjectPart>) -> Self {
+    pub fn object_with_mutability(list: Vec<ObjectPart>, mutability: ObjectMutability) -> Self {
         Self::Object {
             total_nodes: 1 + list
                 .iter()
@@ -816,7 +816,7 @@ impl JsValue {
                 })
                 .sum::<u32>(),
             parts: list,
-            mutable: false,
+            mutability,
         }
     }
 
@@ -1034,7 +1034,7 @@ impl JsValue {
             JsValue::Object {
                 total_nodes: c,
                 parts,
-                mutable: _,
+                mutability: _,
             } => {
                 *c = 1 + parts
                     .iter()
