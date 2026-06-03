@@ -10,6 +10,7 @@ error - [resolve] /turbopack/crates/turbopack-tests/tests/snapshot/comptime/cros
       15 | }
       16 | console.log(UPPER)
       17 | 
+      18 | import { nonConstant } from './non-constant' with { turbopackConstants: 'true' }
   
   
   

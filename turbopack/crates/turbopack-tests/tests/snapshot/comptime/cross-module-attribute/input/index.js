@@ -14,3 +14,11 @@ if (UPPER === 'UPPER') {
   require('./correct-not-inlined')
 }
 console.log(UPPER)
+
+import { nonConstant } from './non-constant' with { turbopackConstants: 'true' }
+if (nonConstant.v === 1234) {
+  console.log('x')
+} else {
+  require('./correct-not-inlined')
+}
+console.log(nonConstant)

@@ -79,10 +79,16 @@ pub async fn module_value_to_constants_module(
     }))
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, NonLocalValue, TraceRawVcs, Encode, Decode)]
+enum ConstantsModuleExport {
+    Constant(ConstantValueBitEquality),
+    NonConstant(ResolvedVc<NonConstantIssue>),
+}
+
 #[turbo_tasks::value]
 #[derive(Debug)]
 struct ConstantsModule {
-    exports: Vec<(RcStr, Option<ConstantValueBitEquality>)>,
+    exports: Vec<(RcStr, ConstantsModuleExport)>,
     has_directive: bool,
 }
 
@@ -107,34 +113,54 @@ impl ConstantsModule {
                 .map(|(key, value)| {
                     ObjectPart::KeyValue(
                         JsValue::Constant(ConstantValue::Str(key.clone().into())),
-                        if let Some(value) = value {
-                            if !has_opt_in {
-                                // when not having opt in, only inline short literals
-                                match &value.0 {
-                                    ConstantValue::Str(s) if s.as_str().len() > 6 => {
-                                        JsValue::unknown_empty(false, rcstr!("constant too long"))
+                        match value {
+                            ConstantsModuleExport::Constant(value) => {
+                                if !has_opt_in {
+                                    // when not having opt in, only inline short literals
+                                    match &value.0 {
+                                        ConstantValue::Str(s) if s.as_str().len() > 6 => {
+                                            JsValue::unknown_empty(
+                                                false,
+                                                rcstr!("constant too long"),
+                                            )
+                                        }
+                                        ConstantValue::Num(n) if n.0.abs() > 1_000_000.0 => {
+                                            JsValue::unknown_empty(
+                                                false,
+                                                rcstr!("constant too long"),
+                                            )
+                                        }
+                                        ConstantValue::BigInt(n)
+                                            if **n > BigInt::from(1_000_000)
+                                                || **n < BigInt::from(-1_000_000) =>
+                                        {
+                                            JsValue::unknown_empty(
+                                                false,
+                                                rcstr!("constant too long"),
+                                            )
+                                        }
+                                        ConstantValue::Regex(_) => {
+                                            // Regexes are literals, but they are also objects, so
+                                            // have identity and aren't inlined without opt in.
+                                            JsValue::unknown_empty(
+                                                false,
+                                                rcstr!("regex not inlined"),
+                                            )
+                                        }
+                                        v => JsValue::Constant(v.clone()),
                                     }
-                                    ConstantValue::Num(n) if n.0.abs() > 1_000_000.0 => {
-                                        JsValue::unknown_empty(false, rcstr!("constant too long"))
-                                    }
-                                    ConstantValue::BigInt(n)
-                                        if **n > BigInt::from(1_000_000)
-                                            || **n < BigInt::from(-1_000_000) =>
-                                    {
-                                        JsValue::unknown_empty(false, rcstr!("constant too long"))
-                                    }
-                                    ConstantValue::Regex(_) => {
-                                        // Regexes are literals, but they are also objects, so
-                                        // have identity and aren't inlined without opt in.
-                                        JsValue::unknown_empty(false, rcstr!("regex not inlined"))
-                                    }
-                                    v => JsValue::Constant(v.clone()),
+                                } else {
+                                    JsValue::Constant(value.0.clone())
                                 }
-                            } else {
-                                JsValue::Constant(value.0.clone())
                             }
-                        } else {
-                            JsValue::unknown_empty(false, rcstr!("not a constant"))
+                            ConstantsModuleExport::NonConstant(issue) => {
+                                if constant_annotation == Some(true) {
+                                    // If self.has_directive, then we already emitted the issue in
+                                    // get_constants.
+                                    issue.emit();
+                                }
+                                JsValue::unknown_empty(false, rcstr!("not a constant"))
+                            }
                         },
                     )
                 })
@@ -191,10 +217,7 @@ pub async fn get_constants(
 
     let compile_time_info_ref = compile_time_info.await?;
 
-    let exports: Vec<(
-        RcStr,
-        std::result::Result<ConstantValueBitEquality, Option<NonConstantIssue>>,
-    )> = eval_context
+    let exports = eval_context
         .imports
         .exports_ids
         .iter()
@@ -245,50 +268,31 @@ pub async fn get_constants(
             if let JsValue::Constant(constant) = linked_value.0 {
                 Ok((
                     export_name.as_str().into(),
-                    Ok(ConstantValueBitEquality(constant)),
+                    ConstantsModuleExport::Constant(ConstantValueBitEquality(constant)),
                 ))
             } else {
+                let explained = linked_value.0.explain(10, 5);
+                let issue = NonConstantIssue::new(
+                    export_name.as_str().into(),
+                    module.ident().await?.path.clone(),
+                    module.source().await?.map(|source| {
+                        IssueSource::from_swc_offsets(source, span.lo.to_u32(), span.hi.to_u32())
+                    }),
+                    (explained.0.into(), explained.1.into()),
+                )
+                .to_resolved()
+                .await?;
+                if directives.constants_module {
+                    issue.emit();
+                }
                 Ok((
                     export_name.as_str().into(),
-                    if directives.constants_module {
-                        Err(Some(NonConstantIssue {
-                            export: export_name.as_str().into(),
-                            file_path: module.ident().await?.path.clone(),
-                            source: module.source().await?.map(|source| {
-                                IssueSource::from_swc_offsets(
-                                    source,
-                                    span.lo.to_u32(),
-                                    span.hi.to_u32(),
-                                )
-                            }),
-                            value: linked_value.0.explain(10, 5),
-                        }))
-                    } else {
-                        Err(None)
-                    },
+                    ConstantsModuleExport::NonConstant(issue),
                 ))
             }
         })
         .try_join()
         .await?;
-
-    let exports = exports
-        .into_iter()
-        .map(|(name, value)| {
-            (
-                name,
-                match value {
-                    Ok(v) => Some(v),
-                    Err(issue) => {
-                        if let Some(issue) = issue {
-                            issue.resolved_cell().emit();
-                        }
-                        None
-                    }
-                },
-            )
-        })
-        .collect();
 
     Ok(Vc::cell(Some(ConstantsModule {
         exports,
@@ -301,7 +305,26 @@ struct NonConstantIssue {
     export: RcStr,
     file_path: FileSystemPath,
     source: Option<IssueSource>,
-    value: (String, String),
+    value: (RcStr, RcStr),
+}
+
+#[turbo_tasks::value_impl]
+impl NonConstantIssue {
+    #[turbo_tasks::function]
+    fn new(
+        export: RcStr,
+        file_path: FileSystemPath,
+        source: Option<IssueSource>,
+        value: (RcStr, RcStr),
+    ) -> Vc<Self> {
+        Self {
+            export,
+            file_path,
+            source,
+            value,
+        }
+        .cell()
+    }
 }
 
 #[async_trait]
@@ -332,16 +355,17 @@ impl Issue for NonConstantIssue {
             [
                 Some(StyledString::Line(vec![
                     StyledString::Text(rcstr!("It was analyzed to be ")),
-                    StyledString::Code(self.value.0.clone().into()),
+                    StyledString::Code(self.value.0.clone()),
                 ])),
-                (!self.value.1.is_empty()).then(|| {
-                    StyledString::Line(vec![StyledString::Code(self.value.1.clone().into())])
-                }),
+                (!self.value.1.is_empty())
+                    .then(|| StyledString::Line(vec![StyledString::Code(self.value.1.clone())])),
                 Some(StyledString::Line(vec![
                     StyledString::Text(rcstr!(
                         "It has to be a constant because the module contains "
                     )),
                     StyledString::Code(rcstr!("use turbopack: constants")),
+                    StyledString::Text(rcstr!(" or was imported with ")),
+                    StyledString::Code(rcstr!("with {turbopackConstants: 'true'}")),
                 ])),
             ]
             .into_iter()
