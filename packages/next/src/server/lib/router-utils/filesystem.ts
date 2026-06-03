@@ -748,14 +748,14 @@ export async function setupFsCheck(opts: {
         let curItemPath = itemPath
         let curDecodedItemPath = decodedItemPath
 
-        const isDynamicOutput = type === 'pageFile' || type === 'appFile'
+        const isPageOrAppFile = type === 'pageFile' || type === 'appFile'
 
         if (i18n) {
           const localeResult = handleLocale(
             itemPath,
             // legacy behavior allows visiting static assets under
             // default locale but no other locale
-            isDynamicOutput
+            isPageOrAppFile
               ? undefined
               : [
                   i18n?.defaultLocale,
@@ -821,7 +821,7 @@ export async function setupFsCheck(opts: {
           } catch {}
         }
 
-        const route = isDynamicOutput
+        const route = isPageOrAppFile
           ? getRouteDefinition(type, curItemPath, locale)
           : undefined
 
@@ -906,14 +906,14 @@ export async function setupFsCheck(opts: {
                   continue
                 }
               }
-            } else if (!isDynamicOutput) {
+            } else if (!isPageOrAppFile) {
               continue
             }
           }
 
           let error: Error | undefined
 
-          if (opts.dev && isDynamicOutput) {
+          if (opts.dev && isPageOrAppFile) {
             if (!route) {
               continue
             }
@@ -948,7 +948,7 @@ export async function setupFsCheck(opts: {
             continue
           }
 
-          if (isDynamicOutput && !route && !matchedItem) {
+          if (isPageOrAppFile && !route && !matchedItem) {
             continue
           }
 
