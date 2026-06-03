@@ -206,6 +206,8 @@ export async function setupFsCheck(opts: {
   // /icon.png -> .../app/icon.png
   const staticMetadataFiles = new Map<string, string>()
   let dynamicRoutes: FilesystemDynamicRoute[] = []
+  // Page and app outputs need route metadata for compilation and rendering.
+  // Static assets remain plain filesystem matches.
   const routeDefinitions = {
     appFile: new Map<string, FilesystemRouteDefinition[]>(),
     pageFile: new Map<string, FilesystemRouteDefinition[]>(),
@@ -270,6 +272,8 @@ export async function setupFsCheck(opts: {
     pathname: string,
     appPaths: readonly string[]
   ): string => {
+    // Prefer the app path that normalizes to the pathname. Keep the final app
+    // path as the fallback because sorted parallel routes place the root last.
     for (let i = appPaths.length - 1; i >= 0; i--) {
       const appPath = appPaths[i]
       if (appNormalizers.pathname.normalize(appPath) === pathname) {
@@ -821,6 +825,8 @@ export async function setupFsCheck(opts: {
           } catch {}
         }
 
+        // Only page and app outputs participate in route rendering. Public,
+        // static, image, and virtual outputs are served as filesystem assets.
         const route = isPageOrAppFile
           ? getRouteDefinition(type, curItemPath, locale)
           : undefined
@@ -934,6 +940,8 @@ export async function setupFsCheck(opts: {
                   requestPath,
                 })
               } catch (err) {
+                // A disappeared route is not a match. Compilation errors still
+                // belong to this route and must render as a 500 downstream.
                 if (err instanceof PageNotFoundError) {
                   continue
                 }
@@ -954,6 +962,8 @@ export async function setupFsCheck(opts: {
 
           let params: Params | undefined
           if (route && isAppPageRouteDefinition(route)) {
+            // Parallel app routes can contribute multiple dynamic app paths
+            // to one pathname. Preserve the params from the matching path.
             for (const appPath of route.appPaths) {
               const routePathname = appNormalizers.pathname.normalize(appPath)
               if (!isDynamicRoute(routePathname)) {
