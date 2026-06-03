@@ -86,7 +86,9 @@
                                     annotations: None,
                                     analyze_for_constants: false,
                                     reference: Some(
-                                        1,
+                                        ModuleReferenceIndex(
+                                            2,
+                                        ),
                                     ),
                                 },
                             ),
@@ -372,7 +374,9 @@
                     annotations: None,
                     analyze_for_constants: false,
                     reference: Some(
-                        1,
+                        ModuleReferenceIndex(
+                            2,
+                        ),
                     ),
                 },
             ),
@@ -519,7 +523,9 @@
                     annotations: None,
                     analyze_for_constants: false,
                     reference: Some(
-                        1,
+                        ModuleReferenceIndex(
+                            2,
+                        ),
                     ),
                 },
             ),
