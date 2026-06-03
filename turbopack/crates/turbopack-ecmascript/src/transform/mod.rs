@@ -82,7 +82,39 @@ pub enum EcmascriptInputTransform {
         emit_decorators_metadata: bool,
         use_define_for_class_fields: bool,
     },
+    /// Experimental: run the Rust port of the React compiler before other transforms.
+    ///
+    /// Uses a text bridge (codegen → react_compiler_swc → re-parse) due to SWC version
+    /// mismatch between turbopack (swc_ecma_ast v23) and react_compiler_swc (v21).
+    /// Source map spans reference the compiled intermediate source, not the original.
+    ReactCompilerRust {
+        compilation_mode: RustReactCompilerCompilationMode,
+    },
 }
+
+/// Compilation mode passed through to `react_compiler_swc`.
+#[turbo_tasks::value(shared)]
+#[derive(Default, Debug, Clone, Copy, Hash)]
+pub enum RustReactCompilerCompilationMode {
+    #[default]
+    Infer,
+    Annotation,
+    All,
+}
+
+impl RustReactCompilerCompilationMode {
+    /// The string form expected by `react_compiler_swc`'s JSON options.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RustReactCompilerCompilationMode::Infer => "infer",
+            RustReactCompilerCompilationMode::Annotation => "annotation",
+            RustReactCompilerCompilationMode::All => "all",
+        }
+    }
+}
+
+#[turbo_tasks::value(transparent)]
+pub struct OptionRustReactCompilerCompilationMode(Option<RustReactCompilerCompilationMode>);
 
 /// The CustomTransformer trait allows you to implement your own custom SWC
 /// transformer to run over all ECMAScript files imported in the graph.
@@ -343,6 +375,9 @@ impl EcmascriptInputTransform {
 
                 apply_transform(program, helpers, decorators(config))
             }
+            EcmascriptInputTransform::ReactCompilerRust { compilation_mode } => {
+                apply_rust_react_compiler(program, ctx, helpers, *compilation_mode).await?
+            }
             EcmascriptInputTransform::Plugin(transform) => {
                 // We cannot pass helpers to plugins, so we return them as is
                 transform.await?.transform(program, ctx).await?;
@@ -350,6 +385,132 @@ impl EcmascriptInputTransform {
             }
         })
     }
+}
+
+/// Experimental text-bridge integration for the Rust React compiler.
+///
+/// Emits the current SWC program to source text, runs it through `react_compiler_swc`,
+/// then re-parses the output. This bridges the SWC version mismatch between Turbopack
+/// (swc_ecma_ast v23) and react_compiler_swc (v21) at the cost of an extra parse/emit
+/// round-trip and degraded source maps (spans reference the compiled source, not original).
+async fn apply_rust_react_compiler(
+    program: &mut Program,
+    ctx: &TransformContext<'_>,
+    helpers: HelperData,
+    compilation_mode: RustReactCompilerCompilationMode,
+) -> Result<HelperData> {
+    {
+        // Only transform files that are user code. The React compiler must not run on
+        // node_modules or any package resolved outside the project root. This guards
+        // against pnpm `file:` symlinks (e.g. a linked Next.js workspace) whose resolved
+        // paths escape node_modules and bypass the InNodeModules foreign-code condition.
+        // In the project VFS, paths outside the root start with "../"; files inside
+        // node_modules contain that segment.
+        if ctx.file_path_str.contains("node_modules") || ctx.file_path_str.starts_with("../") {
+            return Ok(helpers);
+        }
+
+        // Only transform files that have React components or hooks. This avoids adding
+        // `useMemoCache` imports to RSC server files, route handlers, and other non-React
+        // modules where the new import would disturb the module graph and cause chunk group
+        // inconsistency errors in get_app_client_references_chunks.
+        if !next_custom_transforms::react_compiler::is_required(program) {
+            return Ok(helpers);
+        }
+
+        use swc_core::{
+            common::FileName,
+            ecma::{
+                ast::EsVersion,
+                codegen::{Config as CodegenConfig, Emitter, text_writer::JsWriter},
+                parser::{EsSyntax, Syntax, parse_file_as_module},
+            },
+        };
+
+        // Step 1: emit current program to text.
+        let source_text = {
+            let mut buf = Vec::new();
+            let wr = JsWriter::new(ctx.source_map.clone(), "\n", &mut buf, None);
+            let mut emitter = Emitter {
+                cfg: CodegenConfig::default(),
+                cm: ctx.source_map.clone(),
+                comments: Some(ctx.comments as &dyn swc_core::common::comments::Comments),
+                wr,
+            };
+            emitter
+                .emit_program(program)
+                .map_err(|e| anyhow::anyhow!("react compiler: emit failed: {e}"))?;
+            String::from_utf8(buf)
+                .map_err(|e| anyhow::anyhow!("react compiler: non-utf8 output: {e}"))?
+        };
+
+        // Step 2: run through react_compiler_swc (text in, text out).
+        // react_compiler_swc ships its own swc_ecma_ast v21 which is binary-incompatible with
+        // our v23, so we use the source-text API as a serialization boundary.
+        //
+        // TODO: once SWC versions align (or react_compiler exposes a version-agnostic AST API),
+        // replace this with a direct AST-level integration to restore proper source maps.
+        let options = react_compiler_swc_options(ctx, compilation_mode)?;
+        let result = react_compiler_swc::transform_source(&source_text, options);
+
+        for diag in &result.diagnostics {
+            tracing::warn!(
+                file = ctx.file_path_str,
+                "React Compiler (Rust): {}",
+                diag.message
+            );
+        }
+
+        let Some(compiled_module) = result.module else {
+            return Ok(helpers);
+        };
+
+        // Step 3: emit compiled module back to string using react_compiler_swc's own codegen
+        // (which understands its v21 AST types).
+        let compiled_text =
+            react_compiler_swc::emit_with_comments(&compiled_module, result.comments.as_ref(), &[]);
+
+        // Step 4: re-parse the compiled text with our swc_core v23.
+        // The new spans reference `compiled_text`, not the original file — source maps will
+        // show the react-compiler output rather than the user's original source.
+        let fm = ctx.source_map.new_source_file(
+            FileName::Custom(format!("[react-compiler] {}", ctx.file_path_str)).into(),
+            compiled_text,
+        );
+        let new_module = parse_file_as_module(
+            &fm,
+            Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            EsVersion::latest(),
+            Some(ctx.comments),
+            &mut vec![],
+        )
+        .map_err(|e| anyhow::anyhow!("react compiler: re-parse failed: {e:?}"))?;
+
+        *program = Program::Module(new_module);
+        Ok(helpers)
+    }
+}
+
+fn react_compiler_swc_options(
+    ctx: &TransformContext<'_>,
+    compilation_mode: RustReactCompilerCompilationMode,
+) -> Result<react_compiler::entrypoint::plugin_options::PluginOptions> {
+    serde_json::from_value(serde_json::json!({
+        "shouldCompile": true,
+        "enableReanimated": false,
+        "isDev": ctx.node_env != "production",
+        "compilationMode": compilation_mode.as_str(),
+        "panicThreshold": "none",
+        "flowSuppressions": false,
+        "noEmit": false,
+        "ignoreUseNoForget": false,
+        "filename": ctx.file_name_str,
+        "environment": {}
+    }))
+    .map_err(|e| anyhow::anyhow!("react compiler: invalid options: {e}"))
 }
 
 fn apply_transform(program: &mut Program, helpers: HelperData, op: impl Pass) -> HelperData {

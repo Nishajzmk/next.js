@@ -556,6 +556,9 @@ pub async fn get_server_module_options_context(
     .collect();
 
     let source_maps = *next_config.server_source_maps().await?;
+    // `react/compiler-runtime` is aliased per-context in next_import_map.rs to the appropriate
+    // vendored snapshot (ssr/ or rsc/), so the compiler is safe to enable in all server contexts.
+    let enable_rust_react_compiler = *next_config.rust_react_compiler().await?;
     let module_options_context = ModuleOptionsContext {
         ecmascript: EcmascriptOptionsContext {
             enable_typeof_window_inlining: Some(TypeofWindow::Undefined),
@@ -659,6 +662,7 @@ pub async fn get_server_module_options_context(
                     enable_jsx: Some(jsx_runtime_options),
                     enable_typescript_transform: Some(tsconfig),
                     enable_decorators: Some(decorators_options.to_resolved().await?),
+                    enable_rust_react_compiler,
                     ..module_options_context.ecmascript
                 },
                 enable_webpack_loaders,
@@ -721,6 +725,7 @@ pub async fn get_server_module_options_context(
                     enable_jsx: Some(jsx_runtime_options),
                     enable_typescript_transform: Some(tsconfig),
                     enable_decorators: Some(decorators_options.to_resolved().await?),
+                    enable_rust_react_compiler,
                     ..module_options_context.ecmascript
                 },
                 enable_webpack_loaders,
@@ -801,6 +806,7 @@ pub async fn get_server_module_options_context(
                     enable_jsx: Some(rsc_jsx_runtime_options),
                     enable_typescript_transform: Some(tsconfig),
                     enable_decorators: Some(decorators_options.to_resolved().await?),
+                    enable_rust_react_compiler,
                     ..module_options_context.ecmascript
                 },
                 enable_webpack_loaders,
@@ -877,6 +883,7 @@ pub async fn get_server_module_options_context(
                     enable_jsx: Some(rsc_jsx_runtime_options),
                     enable_typescript_transform: Some(tsconfig),
                     enable_decorators: Some(decorators_options.to_resolved().await?),
+                    enable_rust_react_compiler,
                     ..module_options_context.ecmascript
                 },
                 enable_webpack_loaders,
@@ -964,6 +971,7 @@ pub async fn get_server_module_options_context(
                     enable_jsx: Some(jsx_runtime_options),
                     enable_typescript_transform: Some(tsconfig),
                     enable_decorators: Some(decorators_options.to_resolved().await?),
+                    enable_rust_react_compiler,
                     ..module_options_context.ecmascript
                 },
                 enable_webpack_loaders,

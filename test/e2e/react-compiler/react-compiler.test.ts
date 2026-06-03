@@ -16,7 +16,7 @@ function normalizeCodeLocInfo(str) {
   )
 }
 
-describe.each(['default', 'babelrc'] as const)(
+describe.each(['default', 'babelrc', 'rust'] as const)(
   'react-compiler %s',
   (variant) => {
     const dependencies = (global as any).isNextDeploy
@@ -34,7 +34,17 @@ describe.each(['default', 'babelrc'] as const)(
           : {
               app: new FileRef(join(__dirname, 'app')),
               pages: new FileRef(join(__dirname, 'pages')),
-              'next.config.js': new FileRef(join(__dirname, 'next.config.js')),
+              'next.config.js':
+                variant === 'rust'
+                  ? `
+                      /** @type {import('next').NextConfig} */
+                      module.exports = {
+                        reactCompiler: true,
+                        experimental: { rustReactCompiler: true },
+                        reactProductionProfiling: true,
+                      }
+                    `
+                  : new FileRef(join(__dirname, 'next.config.js')),
               'reference-library': new FileRef(
                 join(__dirname, 'reference-library')
               ),
@@ -48,6 +58,13 @@ describe.each(['default', 'babelrc'] as const)(
         ...(isReact18 ? { 'react-compiler-runtime': 'latest' } : {}),
         ...dependencies,
       },
+    })
+
+    // The Rust compiler path is only wired through Turbopack; webpack ignores reactCompiler.rust.
+    beforeEach(function () {
+      if (variant === 'rust' && !isTurbopack) {
+        this.skip()
+      }
     })
 
     it('should memoize Components', async () => {

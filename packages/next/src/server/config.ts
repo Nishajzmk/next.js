@@ -494,6 +494,13 @@ function assignDefaultsAndValidate(
           `Please remove the option or run Next.js with webpack in ${configFileName}.`
       )
     }
+
+    if (result.experimental.rustReactCompiler && !process.env.TURBOPACK) {
+      throw new Error(
+        `\`experimental.rustReactCompiler\` is only supported with Turbopack. ` +
+          `Please remove the option or run Next.js with Turbopack in ${configFileName}.`
+      )
+    }
   }
 
   if (result.experimental.cachedNavigations && !result.cacheComponents) {

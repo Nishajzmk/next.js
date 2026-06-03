@@ -352,6 +352,8 @@ pub async fn get_client_module_options_context(
             .resolved_cell()
         });
 
+    let enable_rust_react_compiler = *next_config.rust_react_compiler().await?;
+
     let module_options_context = ModuleOptionsContext {
         ecmascript: EcmascriptOptionsContext {
             esm_url_rewrite_behavior: Some(UrlRewriteBehavior::Relative),
@@ -361,6 +363,7 @@ pub async fn get_client_module_options_context(
             source_maps,
             infer_module_side_effects: *next_config.turbopack_infer_module_side_effects().await?,
             preset_env_config,
+            // enable_rust_react_compiler is set on the final user-code context below
             ..Default::default()
         },
         css: CssOptionsContext {
@@ -400,7 +403,7 @@ pub async fn get_client_module_options_context(
             // Don't inject core-js polyfills into node_modules — only user code
             // should be processed by preset_env's usage/entry mode.
             preset_env_config: None,
-            ..module_options_context.ecmascript
+            ..module_options_context.ecmascript.clone()
         },
         enable_webpack_loaders: foreign_enable_webpack_loaders,
         enable_postcss_transform: enable_foreign_postcss_transform,
@@ -432,6 +435,7 @@ pub async fn get_client_module_options_context(
             enable_jsx: Some(jsx_runtime_options),
             enable_typescript_transform: Some(tsconfig),
             enable_decorators: Some(decorators_options.to_resolved().await?),
+            enable_rust_react_compiler,
             ..module_options_context.ecmascript.clone()
         },
         enable_webpack_loaders,
