@@ -300,9 +300,9 @@ impl From<u32> for ModuleReferenceIndex {
         ModuleReferenceIndex(unsafe { NonZeroU32::new_unchecked(value + 1) })
     }
 }
-impl From<ModuleReferenceIndex> for u32 {
-    fn from(value: ModuleReferenceIndex) -> Self {
-        value.0.get() - 1
+impl ModuleReferenceIndex {
+    pub fn get(&self) -> usize {
+        (self.0.get() - 1) as usize
     }
 }
 
