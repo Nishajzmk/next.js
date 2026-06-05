@@ -172,6 +172,11 @@ impl ConstantsModule {
                     )
                 })
                 .collect(),
+            // TODO ideally this would just use ObjectMutability::Frozen.
+            //
+            // When not opted in, this has to stay FrozenSubset though, because when importing a
+            // non-constant export, it should not be replaced with `undefined` (which is what
+            // Frozen) would do.
             ObjectMutability::FrozenSubset,
         )
     }
