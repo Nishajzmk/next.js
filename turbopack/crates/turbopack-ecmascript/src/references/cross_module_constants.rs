@@ -30,6 +30,10 @@ use crate::{
     references::{early_value_visitor, esm::EsmAssetReference},
 };
 
+const STRING_INLINE_THRESHOLD: usize = 6;
+const NUMBER_INLINE_THRESHOLD: f64 = 1_000_000.0;
+const BIGINT_INLINE_THRESHOLD: i64 = 1_000_000;
+
 /// Import names that are all-uppercase and contain at least one letter are eligible for automatic
 /// constant inlining, even without an import attribute.
 pub fn is_import_name_eligible_for_exports(name: &str) -> bool {
@@ -117,21 +121,25 @@ impl ConstantsModule {
                                 if !has_opt_in {
                                     // when not having opt in, only inline short literals
                                     match &value.0 {
-                                        ConstantValue::Str(s) if s.as_str().len() > 6 => {
+                                        ConstantValue::Str(s)
+                                            if s.as_str().len() > STRING_INLINE_THRESHOLD =>
+                                        {
                                             JsValue::unknown_empty(
                                                 false,
                                                 rcstr!("constant too long"),
                                             )
                                         }
-                                        ConstantValue::Num(n) if n.0.abs() > 1_000_000.0 => {
+                                        ConstantValue::Num(n)
+                                            if n.0.abs() > NUMBER_INLINE_THRESHOLD =>
+                                        {
                                             JsValue::unknown_empty(
                                                 false,
                                                 rcstr!("constant too long"),
                                             )
                                         }
                                         ConstantValue::BigInt(n)
-                                            if **n > BigInt::from(1_000_000)
-                                                || **n < BigInt::from(-1_000_000) =>
+                                            if **n > BigInt::from(BIGINT_INLINE_THRESHOLD)
+                                                || **n < BigInt::from(-BIGINT_INLINE_THRESHOLD) =>
                                         {
                                             JsValue::unknown_empty(
                                                 false,
