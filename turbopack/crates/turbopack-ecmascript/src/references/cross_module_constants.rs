@@ -61,13 +61,12 @@ pub async fn module_value_to_constants_module(
     // We are reusing the exact resolve options from EsmAssetReference here, which is good and gives
     // us side-effect-free barrel file resolving for free.
     let resolved = import_reference.resolve_reference().await?;
-    let resolved = resolved.primary_modules().await?;
-    let Some(module) = resolved.first() else {
+    let Some(module) = resolved.first_module().await? else {
         // failed to resolve, issue was already emitted by resolve_reference
         return Ok(None);
     };
 
-    let constants = get_constants(**module, compile_time_info).await?;
+    let constants = get_constants(*module, compile_time_info).await?;
 
     Ok(constants.as_ref().map(|constants| {
         constants.as_js_value(
