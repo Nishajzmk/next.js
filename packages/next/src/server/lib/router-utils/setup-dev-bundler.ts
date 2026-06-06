@@ -364,18 +364,16 @@ async function startWatcher(
   }
 
   opts.fsChecker.ensureCallback(async function ensure(item) {
-    if (item.type === 'appFile' || item.type === 'pageFile') {
-      const definition = item.route
-      // App paths can normalize away groups and parallel slots. Ensure the
-      // concrete route definition rather than the normalized request pathname.
-      await hotReloader.ensurePage({
-        clientOnly: false,
-        page: definition?.page ?? item.itemPath,
-        isApp: item.type === 'appFile',
-        definition,
-        url: item.requestPath,
-      })
-    }
+    const definition = item.route
+    // App paths can normalize away groups and parallel slots. Ensure the
+    // concrete route definition rather than the normalized request pathname.
+    await hotReloader.ensurePage({
+      clientOnly: false,
+      page: definition.page,
+      isApp: item.type === 'appFile',
+      definition,
+      url: item.requestPath,
+    })
   })
 
   let resolved = false
