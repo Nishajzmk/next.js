@@ -3,9 +3,6 @@
  */
 const nextConfig = {
   experimental: {
-    // TODO(appShells): migrate this test to the two-phase (app shell +
-    // per-page data) prefetch behavior, then remove this override. See #94516.
-    appShells: false,
     // The client segment cache currently only writes segment data during
     // prefetches, not during navigations. The staleTimes feature is an
     // exception: it preserves route cache entries for reuse across

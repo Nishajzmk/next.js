@@ -355,17 +355,28 @@ describe('segment cache - vary params', () => {
       await toggle.click()
     }, [{ includes: 'Page: aaa' }, { includes: 'Static page body' }])
 
-    // Second prefetch: head re-fetched (metadata varies on slug),
-    // but body is cached (body doesn't access slug)
+    // Second link with a different slug. The body is param-independent and
+    // already cached (via the App Shell), and the param-dependent head is NOT
+    // speculatively prefetched on link reveal under App Shells — it's deferred
+    // to navigation. So revealing the link fires no request at all, which also
+    // proves the body is reused from cache (changing the slug doesn't
+    // re-prefetch it).
     await act(async () => {
       const toggle = await browser.elementByCss(
         'input[data-link-accordion="/metadata/bbb"]'
       )
       await toggle.click()
-    }, [
-      { includes: 'Page: bbb' },
-      { includes: 'Static page body', block: 'reject' },
-    ])
+    }, 'no-requests')
+
+    // Navigating fetches the param-dependent head for bbb (metadata varies on
+    // slug, so it can't reuse the cached aaa head).
+    await act(
+      async () => {
+        const link = await browser.elementByCss('a[href="/metadata/bbb"]')
+        await link.click()
+      },
+      { includes: 'Page: bbb' }
+    )
   })
 
   it('caches head segment when generateMetadata does not access params', async () => {
@@ -409,16 +420,17 @@ describe('segment cache - vary params', () => {
       },
     })
 
-    // First prefetch fetches both layout and page
+    // First prefetch fetches the route. The page's static shell (the
+    // "Page category:" label) is param-independent and lands in the App Shell
+    // prefetch, which `act` ignores; only its resolved value arrives on
+    // navigation. What's observable here is the per-link prefetch of the
+    // param-dependent layout content for this concrete param.
     await act(async () => {
       const toggle = await browser.elementByCss(
         'input[data-link-accordion="/page-reuse/electronics/phone"]'
       )
       await toggle.click()
-    }, [
-      { includes: 'Layout: electronics/phone' },
-      { includes: 'Page category:' },
-    ])
+    }, [{ includes: 'Layout: electronics/phone' }])
 
     // Second prefetch: layout re-fetched (varies on item),
     // page is cached (only varies on category)
@@ -716,14 +728,25 @@ describe('segment cache - vary params', () => {
       { includes: 'Runtime Metadata: aaa' }
     )
 
-    // Second prefetch with different slug triggers a new request
-    // (metadata varies on slug, so it can't reuse the cache)
+    // Second link with a different slug. The param-independent body is already
+    // cached (App Shell), and the param-dependent head is NOT speculatively
+    // prefetched on link reveal under App Shells — it's deferred to navigation.
+    // So revealing the link fires no request.
+    await act(async () => {
+      const toggle = await browser.elementByCss(
+        'input[data-link-accordion="/runtime-prefetch-metadata/bbb"]'
+      )
+      await toggle.click()
+    }, 'no-requests')
+
+    // Navigating fetches the param-dependent head for bbb (metadata varies on
+    // slug, so it can't reuse the cached aaa head).
     await act(
       async () => {
-        const toggle = await browser.elementByCss(
-          'input[data-link-accordion="/runtime-prefetch-metadata/bbb"]'
+        const link = await browser.elementByCss(
+          'a[href="/runtime-prefetch-metadata/bbb"]'
         )
-        await toggle.click()
+        await link.click()
       },
       { includes: 'Runtime Metadata: bbb' }
     )
