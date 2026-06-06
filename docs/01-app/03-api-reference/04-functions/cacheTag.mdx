@@ -89,7 +89,7 @@ export default async function submit() {
 }
 ```
 
-For forms and other user-triggered mutations where the user should see their change immediately, use `updateTag` instead:
+For forms and other user-triggered mutations where the user should see their change immediately, use [`updateTag`](/docs/app/api-reference/functions/updateTag) instead. `updateTag` is only available in [Server Functions](/docs/app/getting-started/mutating-data); use `revalidateTag` from [Route Handlers](/docs/app/api-reference/file-conventions/route) and other contexts.
 
 ```tsx filename="app/action.ts" switcher
 'use server'
