@@ -89,6 +89,30 @@ export default async function submit() {
 }
 ```
 
+For forms and other user-triggered mutations where the user should see their change immediately, use `updateTag` instead:
+
+```tsx filename="app/action.ts" switcher
+'use server'
+
+import { updateTag } from 'next/cache'
+
+export default async function submit() {
+  await addPost()
+  updateTag('my-data')
+}
+```
+
+```jsx filename="app/action.js" switcher
+'use server'
+
+import { updateTag } from 'next/cache'
+
+export default async function submit() {
+  await addPost()
+  updateTag('my-data')
+}
+```
+
 ## Good to know
 
 - **Idempotent Tags**: Applying the same tag multiple times has no additional effect.
