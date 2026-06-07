@@ -230,6 +230,17 @@ export type RouteCacheEntry =
 type SegmentCacheEntryShared = {
   fetchStrategy: FetchStrategy
 
+  /**
+   * True if this entry was fulfilled from a fallback shell response (the page
+   * had not yet been prerendered with concrete params). The scheduler uses
+   * this to retry the static prefetch, since a more complete version may
+   * become available once the server's background regeneration finishes.
+   *
+   * Distinct from `isPartial`: a fully-prerendered PPR page can have partial
+   * segments that should NOT be retried. See `SegmentPrefetchResponse`.
+   */
+  isUpgradeableISRFallback: boolean
+
   // Map-related fields.
   ref: UnknownMapEntry | null
   size: number
@@ -947,6 +958,7 @@ export function createDetachedSegmentCacheEntry(
     fetchStrategy: FetchStrategy.PPR,
     rsc: null,
     isPartial: true,
+    isUpgradeableISRFallback: false,
     promise: null,
 
     // Map-related fields
@@ -1018,7 +1030,9 @@ export function attemptToFulfillDynamicSegmentFromBFCache(
       pendingSegment,
       bfcacheEntry.rsc,
       dynamicPrefetchStaleAt,
-      isPartial
+      isPartial,
+      // bfcache data is concrete, never an ISR fallback.
+      false
     )
   }
   return null
@@ -1051,7 +1065,9 @@ export function attemptToUpgradeSegmentFromBFCache(
       pendingSegment,
       bfcacheEntry.rsc,
       dynamicPrefetchStaleAt,
-      isPartial
+      isPartial,
+      // bfcache data is concrete, never an ISR fallback.
+      false
     )
     const segmentVaryPath = getSegmentVaryPathForRequest(
       FetchStrategy.Full,
@@ -1193,13 +1209,19 @@ function fulfillSegmentCacheEntry(
   segmentCacheEntry: PendingSegmentCacheEntry,
   rsc: React.ReactNode,
   staleAt: number,
-  isPartial: boolean
+  isPartial: boolean,
+  // Only static (per-segment PPR) responses can be ISR fallbacks; all other
+  // callers pass false. Always assigned (even when false) so that re-fulfilling
+  // a previously-fallback entry with a concrete response clears the flag and
+  // ends the retry loop.
+  isUpgradeableISRFallback: boolean
 ): FulfilledSegmentCacheEntry {
   const fulfilledEntry: FulfilledSegmentCacheEntry = segmentCacheEntry as any
   fulfilledEntry.status = EntryStatus.Fulfilled
   fulfilledEntry.rsc = rsc
   fulfilledEntry.staleAt = staleAt
   fulfilledEntry.isPartial = isPartial
+  fulfilledEntry.isUpgradeableISRFallback = isUpgradeableISRFallback
   // Resolve any listeners that were waiting for this data.
   if (segmentCacheEntry.promise !== null) {
     segmentCacheEntry.promise.resolve(fulfilledEntry)
@@ -1920,7 +1942,18 @@ function rejectRemainingSegmentsInBundle(
   }
 }
 
+// When a static (per-segment PPR) prefetch receives an upgradeable fallback
+// shell, the localized retry loop re-issues the same fetch after this delay to
+// pick up the concrete version once the server's background regeneration
+// finishes.
+const FALLBACK_RETRY_DELAY_MS = 2000
+
+// Maximum number of fallback retries per task, to avoid looping indefinitely
+// if the server keeps returning a fallback (e.g. misconfiguration).
+const MAX_FALLBACK_RETRIES = 3
+
 export async function fetchSegmentsOnCacheMiss(
+  task: PrefetchTask,
   route: FulfilledRouteCacheEntry,
   routeKey: RouteCacheKey,
   tree: RouteTree,
@@ -1934,7 +1967,98 @@ export async function fetchSegmentsOnCacheMiss(
   //
   // Segment fetches are non-blocking so we don't need to ping the scheduler
   // on completion.
+  const result = await fetchSegmentsOnCacheMissImpl(route, routeKey, tree)
 
+  if (!result.ok) {
+    // The fetch failed or was unusable (impl already classified it and chose an
+    // appropriate, offline-aware `staleAt`). Reject the pending entries so they
+    // don't stay Pending forever, and get retried once the entry expires.
+    rejectRemainingSegmentsInBundle(segments, result.staleAt)
+    return null
+  }
+
+  const { serverResponse, responseSize, closed } = result
+
+  // Write the decoded response into the cache, fulfilling the Pending entries
+  // this task owns.
+  writeSegmentBundleResponse(
+    serverResponse,
+    responseSize,
+    segments,
+    segmentCount,
+    Date.now()
+  )
+
+  // If the server served an upgradeable fallback shell, drive a localized
+  // retry loop to pick up the concrete version once the server's background
+  // regeneration finishes. Only the first such response per task starts a loop
+  // (`fallbackRetryStatus === Empty`); once it leaves Empty, no second loop is
+  // started — sibling bundle responses that also got a fallback don't, and
+  // neither does a re-hover.
+  if (
+    serverResponse.isUpgradeableISRFallback &&
+    task.fallbackRetryStatus === EntryStatus.Empty &&
+    !task.isCanceled
+  ) {
+    task.fallbackRetryStatus = EntryStatus.Pending
+    // Fire-and-forget: the loop drives itself via timers and pings the task
+    // on success.
+    void retryUpgradeableFallbackPrefetch(
+      task,
+      route,
+      routeKey,
+      tree,
+      segments,
+      segmentCount
+    )
+  }
+
+  return {
+    value: null,
+    closed,
+  }
+}
+
+type SegmentBundleFetchResult =
+  | {
+      ok: true
+      serverResponse: SegmentPrefetchResponse
+      responseSize: number
+      closed: Promise<void>
+    }
+  | {
+      ok: false
+      // Whether the failure is worth retrying. True when we got a response that
+      // just wasn't usable yet (server error/miss, empty data, or a build-id
+      // mismatch) — the server may be transiently unready. False for a hard
+      // failure (connection dropped, or the response couldn't be decoded) that
+      // re-issuing won't fix.
+      retryable: boolean
+      // The `staleAt` to reject the bundle with when we're not retrying.
+      // Offline failures use -1 so the entry is re-fetched once the scheduler is
+      // re-pinged on reconnect; everything else gets a 10s backoff.
+      staleAt: number
+    }
+
+/**
+ * Issues a single segment-bundle prefetch request, validates it, and decodes
+ * the response. Returns the decoded result (`ok: true`), or `ok: false` with a
+ * `retryable` flag and a `staleAt` for the failure. Never throws: a connection
+ * drop or decode error is caught here and reported as a non-retryable failure
+ * (with an offline-aware `staleAt`), so callers don't each need their own
+ * try/catch + offline handling.
+ *
+ * This deliberately does NOT touch the cache — it neither writes the decoded
+ * segments nor rejects entries. The caller decides what to do with the result:
+ * write it (`fetchSegmentsOnCacheMiss`) or ignore it and try again (the retry
+ * loop). Calling this again with the same arguments reproduces the exact same
+ * request.
+ */
+async function fetchSegmentsOnCacheMissImpl(
+  route: FulfilledRouteCacheEntry,
+  routeKey: RouteCacheKey,
+  tree: RouteTree
+): Promise<SegmentBundleFetchResult> {
   // Use the canonical URL to request the segment, not the original URL. These
   // are usually the same, but the canonical URL will be different if the route
   // tree response was redirected. To avoid an extra waterfall on every segment
@@ -1967,6 +2091,16 @@ export async function fetchSegmentsOnCacheMiss(
     ? // In output: "export" mode, we need to add the segment path to the URL.
       addSegmentPathToUrlInOutputExportMode(url, normalizedRequestKey)
     : url
+
+  // A response that was fetched but isn't usable yet (server error/miss, empty
+  // data, or a build-id mismatch). The server may be transiently unready, so
+  // this is retryable; a 10s backoff applies if we choose not to retry.
+  const unusable: SegmentBundleFetchResult = {
+    ok: false,
+    retryable: true,
+    staleAt: Date.now() + 10 * 1000,
+  }
+
   try {
     const response = await fetchPrefetchResponse(requestUrl, headers)
     if (
@@ -1984,10 +2118,8 @@ export async function fetchSegmentsOnCacheMiss(
         !isOutputExportMode) ||
       !response.body
     ) {
-      // Server responded with an error, or with a miss. We should still cache
-      // the response, but we can try again after 10 seconds.
-      rejectRemainingSegmentsInBundle(segments, Date.now() + 10 * 1000)
-      return null
+      // Server responded with an error or a miss.
+      return unusable
     }
 
     // See TODO in fetchRouteOnCacheMiss about removing `closed` for
@@ -1997,15 +2129,6 @@ export async function fetchSegmentsOnCacheMiss(
     const { stream: prefetchStream, size: responseSize } =
       await createNonTaskyPrefetchResponseStream(response.body)
     closed.resolve()
-    // Distribute the response size evenly across all segments in the bundle.
-    const averageSize = responseSize / segmentCount
-    let sizeNode: SegmentBundle | null = segments
-    while (sizeNode !== null) {
-      if (sizeNode.entry !== null) {
-        setSizeInCacheMap(sizeNode.entry, averageSize)
-      }
-      sizeNode = sizeNode.parent
-    }
 
     // Parse the response. Always a SegmentPrefetchResponse with a build ID
     // and a data array.
@@ -2016,12 +2139,8 @@ export async function fetchSegmentsOnCacheMiss(
         { allowPartialStream: true }
       )
 
-    const now = Date.now()
-    const serverDataArray = serverResponse.data
-
-    if (serverDataArray.length === 0) {
-      rejectRemainingSegmentsInBundle(segments, now + 10 * 1000)
-      return null
+    if (serverResponse.data.length === 0) {
+      return unusable
     }
     if (
       (response.headers.get(NEXT_NAV_DEPLOYMENT_ID_HEADER) ??
@@ -2029,92 +2148,196 @@ export async function fetchSegmentsOnCacheMiss(
     ) {
       // The server build does not match the client. Treat as a 404. During
       // an actual navigation, the router will trigger an MPA navigation.
-      rejectRemainingSegmentsInBundle(segments, now + 10 * 1000)
-      return null
+      return unusable
     }
 
-    // Walk the segments list and the response array in parallel, fulfilling
-    // each cache entry from the corresponding response element.
-    let node: SegmentBundle | null = segments
-    let dataIndex = 0
-    while (node !== null && dataIndex < serverDataArray.length) {
-      const data = serverDataArray[dataIndex]
-
-      // Null data means this segment has prefetching disabled. Skip it
-      // without creating a cache entry.
-      if (data === null || node.tree === null) {
-        node = node.parent
-        dataIndex++
-        continue
-      }
-
-      const entryStaleAt = now + getStaleTimeMs(data.staleTime)
-
-      // Determine the canonical vary path for this segment. If the server
-      // tells us which params the segment varies by, re-key to a more
-      // generic path. Otherwise use the request vary path.
-      const canonicalVaryPath =
-        process.env.__NEXT_VARY_PARAMS && data.varyParams !== null
-          ? getFulfilledSegmentVaryPath(node.tree.varyPath, data.varyParams)
-          : getSegmentVaryPathForRequest(FetchStrategy.PPR, node.tree)
-
-      let fulfilled: FulfilledSegmentCacheEntry | null = null
-      const nodeEntry = node.entry
-      if (nodeEntry !== null && nodeEntry.status === EntryStatus.Pending) {
-        // We own this entry — fulfill it directly.
-        fulfilled = fulfillSegmentCacheEntry(
-          nodeEntry as PendingSegmentCacheEntry,
-          data.rsc,
-          entryStaleAt,
-          data.isPartial
-        )
-      } else {
-        // We don't own this entry. Create a detached entry and attempt
-        // to upsert it into the canonical slot.
-        const detachedEntry = createDetachedSegmentCacheEntry(now)
-        fulfilled = fulfillSegmentCacheEntry(
-          upgradeToPendingSegment(detachedEntry, FetchStrategy.PPR),
-          data.rsc,
-          entryStaleAt,
-          data.isPartial
-        )
-      }
-
-      // Set the fulfilled entry into the canonical cache slot.
-      upsertSegmentEntry(now, canonicalVaryPath, fulfilled)
-
-      node = node.parent
-      dataIndex++
-    }
-
-    // If the server returned fewer segments than expected, reject any
-    // remaining pending entries so they don't stay Pending forever.
-    if (node !== null) {
-      rejectRemainingSegmentsInBundle(node, now + 10 * 1000)
-    }
-
-    return {
-      value: null,
-      closed: closed.promise,
-    }
+    return { ok: true, serverResponse, responseSize, closed: closed.promise }
   } catch (error) {
-    // Either the connection itself failed, or something bad happened while
-    // decoding the response.
+    // The connection itself failed, or something bad happened while decoding the
+    // response. Re-issuing won't fix a malformed response, so this is not
+    // retryable. If we're offline, reject with staleAt=-1 so the entry expires
+    // immediately and is re-fetched once the scheduler is re-pinged after
+    // connectivity is restored; otherwise apply a 10s backoff. (Unlike
+    // navigations and server actions, prefetches don't await `waitForConnection`.)
+    let staleAt = Date.now() + 10 * 1000
     if (process.env.__NEXT_USE_OFFLINE) {
       const { checkOfflineError } =
         require('../offline') as typeof import('../offline')
       if (checkOfflineError(error)) {
-        // Unlike navigations and server actions, prefetches don't await
-        // waitForConnection — they just reject the cache entry with an
-        // immediate expiration so it gets retried once the scheduler is
-        // re-pinged after connectivity is restored.
-        rejectRemainingSegmentsInBundle(segments, -1)
-        return null
+        staleAt = -1
       }
     }
-    rejectRemainingSegmentsInBundle(segments, Date.now() + 10 * 1000)
-    return null
+    return { ok: false, retryable: false, staleAt }
   }
+}
+
+/**
+ * Writes a parsed segment-bundle response into the cache: distributes the
+ * response size across the bundle, then walks the segments list and the
+ * response array in parallel, fulfilling/upserting each entry. Any segments
+ * the server didn't return are rejected so they don't stay Pending forever.
+ *
+ * Shared by the initial fetch and the localized fallback-retry loop (which
+ * re-issues the same request and upserts the upgraded result here).
+ */
+function writeSegmentBundleResponse(
+  serverResponse: SegmentPrefetchResponse,
+  responseSize: number,
+  segments: SegmentBundle,
+  segmentCount: number,
+  now: number
+): void {
+  // Distribute the response size evenly across all segments in the bundle.
+  const averageSize = responseSize / segmentCount
+  let sizeNode: SegmentBundle | null = segments
+  while (sizeNode !== null) {
+    if (sizeNode.entry !== null) {
+      setSizeInCacheMap(sizeNode.entry, averageSize)
+    }
+    sizeNode = sizeNode.parent
+  }
+
+  const serverDataArray = serverResponse.data
+
+  // True if the server served an upgradeable fallback shell (page not yet
+  // prerendered with concrete params, but the route can be upgraded). Applies
+  // to the whole response and is recorded on each fulfilled entry.
+  const responseIsUpgradeableISRFallback =
+    serverResponse.isUpgradeableISRFallback
+
+  let node: SegmentBundle | null = segments
+  let dataIndex = 0
+  while (node !== null && dataIndex < serverDataArray.length) {
+    const data = serverDataArray[dataIndex]
+
+    // Null data means this segment has prefetching disabled. Skip it
+    // without creating a cache entry.
+    if (data === null || node.tree === null) {
+      node = node.parent
+      dataIndex++
+      continue
+    }
+
+    const entryStaleAt = now + getStaleTimeMs(data.staleTime)
+
+    // Determine the canonical vary path for this segment. If the server
+    // tells us which params the segment varies by, re-key to a more
+    // generic path. Otherwise use the request vary path.
+    const canonicalVaryPath =
+      process.env.__NEXT_VARY_PARAMS && data.varyParams !== null
+        ? getFulfilledSegmentVaryPath(node.tree.varyPath, data.varyParams)
+        : getSegmentVaryPathForRequest(FetchStrategy.PPR, node.tree)
+
+    let fulfilled: FulfilledSegmentCacheEntry | null = null
+    const nodeEntry = node.entry
+    if (nodeEntry !== null && nodeEntry.status === EntryStatus.Pending) {
+      // We own this entry — fulfill it directly.
+      fulfilled = fulfillSegmentCacheEntry(
+        nodeEntry as PendingSegmentCacheEntry,
+        data.rsc,
+        entryStaleAt,
+        data.isPartial,
+        responseIsUpgradeableISRFallback
+      )
+    } else {
+      // We don't own this entry. Create a detached entry and attempt
+      // to upsert it into the canonical slot.
+      const detachedEntry = createDetachedSegmentCacheEntry(now)
+      fulfilled = fulfillSegmentCacheEntry(
+        upgradeToPendingSegment(detachedEntry, FetchStrategy.PPR),
+        data.rsc,
+        entryStaleAt,
+        data.isPartial,
+        responseIsUpgradeableISRFallback
+      )
+    }
+
+    // Set the fulfilled entry into the canonical cache slot.
+    upsertSegmentEntry(now, canonicalVaryPath, fulfilled)
+
+    node = node.parent
+    dataIndex++
+  }
+
+  // If the server returned fewer segments than expected, reject any
+  // remaining pending entries so they don't stay Pending forever.
+  if (node !== null) {
+    rejectRemainingSegmentsInBundle(node, now + 10 * 1000)
+  }
+}
+
+/**
+ * The localized retry loop for an upgradeable fallback shell. Re-issues the
+ * exact same segment-bundle request (via `fetchSegmentsOnCacheMissImpl`) up to
+ * MAX_FALLBACK_RETRIES times, FALLBACK_RETRY_DELAY_MS apart, until the server
+ * returns the concrete (upgraded) version. On success it upserts the upgraded
+ * segments (so they aren't re-fetched) and pings the task, so the task's
+ * *other* fallback segments get re-attempted. If every attempt is still a
+ * fallback (or fails), it gives up.
+ *
+ * A loop runs at most once per task, ever (the caller gates on
+ * `fallbackRetryStatus === Empty`, set to `Pending` before this runs and never
+ * reset to `Empty`). The sleep timer is never `clearTimeout`-ed, so the awaited
+ * sleep always settles; the loop simply checks `isCanceled` after waking and
+ * bails if the task was canceled in the meantime. On success the status becomes
+ * `Fulfilled`; on any non-success exit (exhausted retries, fetch error, or
+ * cancel) it becomes `Rejected`.
+ */
+async function retryUpgradeableFallbackPrefetch(
+  task: PrefetchTask,
+  route: FulfilledRouteCacheEntry,
+  routeKey: RouteCacheKey,
+  tree: RouteTree,
+  segments: SegmentBundle,
+  segmentCount: number
+): Promise<void> {
+  for (let attempt = 0; attempt < MAX_FALLBACK_RETRIES; attempt++) {
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, FALLBACK_RETRY_DELAY_MS)
+    )
+    if (task.isCanceled) {
+      break
+    }
+
+    const result = await fetchSegmentsOnCacheMissImpl(route, routeKey, tree)
+    if (task.isCanceled) {
+      break
+    }
+    if (!result.ok) {
+      if (result.retryable) {
+        // Got a response that wasn't usable yet (the server hasn't finished
+        // regenerating). Try again, or give up once the budget is exhausted.
+        continue
+      }
+      // A hard failure (connection dropped, or the response couldn't be
+      // decoded). Re-issuing the identical request won't fix it, so give up.
+      break
+    }
+    if (result.serverResponse.isUpgradeableISRFallback) {
+      // Still a fallback shell — the server hasn't finished regenerating yet.
+      continue
+    }
+
+    // Success: the server returned the concrete (upgraded) version. Write it
+    // back through the same bundle — its entries were already fulfilled (with
+    // the fallback) by the initial fetch, so none are Pending and every segment
+    // takes the upsert path, replacing the fallback. Mark the loop fulfilled and
+    // ping the task; its other fallback segments are now allowed to revalidate.
+    writeSegmentBundleResponse(
+      result.serverResponse,
+      result.responseSize,
+      segments,
+      segmentCount,
+      Date.now()
+    )
+    task.fallbackRetryStatus = EntryStatus.Fulfilled
+    pingPrefetchTask(task)
+    return
+  }
+
+  // The loop finished without success (exhausted its retries, broke out on a
+  // fetch error, or the task was canceled). It won't run again for this task.
+  task.fallbackRetryStatus = EntryStatus.Rejected
 }
 
 // TODO: The inlined prefetch flow below is temporary. Eventually, inlining
@@ -2786,7 +3009,9 @@ function fulfillEntrySpawnedByRuntimePrefetch(
       ownedEntry,
       rsc,
       staleAt,
-      isPartial
+      isPartial,
+      // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
+      false
     )
     if (fulfilledVaryParams !== null) {
       const fulfilledVaryPath = getFulfilledSegmentVaryPath(
@@ -2815,7 +3040,9 @@ function fulfillEntrySpawnedByRuntimePrefetch(
         upgradeToPendingSegment(newEntry, fetchStrategy),
         rsc,
         staleAt,
-        isPartial
+        isPartial,
+        // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
+        false
       )
       if (fulfilledVaryParams !== null) {
         const fulfilledVaryPath = getFulfilledSegmentVaryPath(
@@ -2840,7 +3067,9 @@ function fulfillEntrySpawnedByRuntimePrefetch(
         ),
         rsc,
         staleAt,
-        isPartial
+        isPartial,
+        // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
+        false
       )
       const varyPath =
         fulfilledVaryParams !== null

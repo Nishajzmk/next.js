@@ -1347,6 +1347,17 @@ export type ExportPathMap = {
      * @internal
      */
     _runInstantValidation?: boolean
+
+    /**
+     * When true, a fallback shell produced for this export path could later be
+     * upgraded to a concrete version (at least one fallback param is a
+     * `generateStaticParams` candidate). Threaded into
+     * `renderOpts.isFallbackUpgradeable` so the build-baked shell carries the
+     * gated `isUpgradeableISRFallback` value.
+     *
+     * @internal
+     */
+    _isFallbackUpgradeable?: boolean
   }
 }
 
