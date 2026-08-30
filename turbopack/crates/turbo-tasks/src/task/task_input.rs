@@ -24,7 +24,7 @@ use turbo_tasks_hash::HashAlgorithm;
 
 // This import is necessary for derive macros to work, as their expansion refers to the crate
 // name directly.
-use crate::{self as turbo_tasks, ReadRef};
+use crate::{self as turbo_tasks, OrdResolvedVc, ReadRef};
 use crate::{
     DynTaskInputs, ResolvedVc, TaskId, TransientInstance, TransientValue, ValueTypeId, Vc,
     trace::TraceRawVcs,
@@ -90,7 +90,12 @@ impl<'a, T> Unpin for CloneReady<'a, T> {}
 /// Structs or enums can be made into task inputs by deriving `TaskInput`:
 ///
 /// ```rust
+/// # use turbo_tasks::{
+/// #     macro_helpers::bincode::{Decode, Encode},
+/// #     trace::TraceRawVcs,
+/// # };
 /// #[turbo_tasks::task_input]
+/// #[derive(Clone, Debug, PartialEq, Eq, Hash, TraceRawVcs, Encode, Decode)]
 /// struct MyStruct {
 ///     // Fields go here...
 /// }
@@ -306,6 +311,19 @@ where
     }
 }
 
+impl<T> TaskInput for OrdResolvedVc<T>
+where
+    T: Send + Sync + ?Sized,
+{
+    fn is_resolved(&self) -> bool {
+        true
+    }
+
+    fn is_transient(&self) -> bool {
+        self.node.is_transient()
+    }
+}
+
 impl<T> TaskInput for TransientValue<T>
 where
     T: DynTaskInputs + Clone + Debug + Hash + Eq + TraceRawVcs + 'static,
@@ -491,8 +509,8 @@ where
 {
     fn resolve_input(&self) -> impl Future<Output = Result<Self>> + Send + '_ {
         self.as_ref().map_either(
-            |l| async move { anyhow::Ok(Self(Either::Left(l.resolve_input().await?))) },
-            |r| async move { anyhow::Ok(Self(Either::Right(r.resolve_input().await?))) },
+            async |l| anyhow::Ok(Self(Either::Left(l.resolve_input().await?))),
+            async |r| anyhow::Ok(Self(Either::Right(r.resolve_input().await?))),
         )
     }
 

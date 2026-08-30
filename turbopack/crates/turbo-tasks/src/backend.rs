@@ -29,11 +29,10 @@ use turbo_rcstr::RcStr;
 use turbo_tasks_hash::DeterministicHasher;
 
 use crate::{
-    CellId, RawVc, ReadCellOptions, ReadOutputOptions, ReadRef, SharedReference, TaskId, TaskIdSet,
-    TaskPriority, TraitRef, TraitTypeId, TurboTasksCallApi, TurboTasksPanic, ValueTypeId,
-    ValueTypePersistence, VcValueTrait, VcValueType,
+    CellId, RawVc, ReadCellOptions, ReadOutcome, ReadOutputOptions, ReadRef, SharedReference,
+    TaskId, TaskIdSet, TaskPriority, TraitRef, TraitTypeId, TurboTasksCallApi, TurboTasksPanic,
+    ValueTypeId, ValueTypePersistence, VcValueTrait, VcValueType,
     dyn_task_inputs::{DynTaskInputs, DynTaskInputsStorage},
-    event::EventListener,
     macro_helpers::NativeFunction,
     manager::{TaskPersistence, TurboTasks},
     registry,
@@ -654,7 +653,7 @@ pub trait Backend: Sized + Sync + Send {
         reader: Option<TaskId>,
         options: ReadOutputOptions,
         turbo_tasks: &TurboTasks<Self>,
-    ) -> Result<Result<RawVc, EventListener>>;
+    ) -> Result<ReadOutcome<RawVc>>;
 
     /// INVALIDATION: Be careful with this, when reader is None, it will not track dependencies, so
     /// using it could break cache invalidation.
@@ -665,7 +664,7 @@ pub trait Backend: Sized + Sync + Send {
         reader: Option<TaskId>,
         options: ReadCellOptions,
         turbo_tasks: &TurboTasks<Self>,
-    ) -> Result<Result<TypedCellContent, EventListener>>;
+    ) -> Result<ReadOutcome<TypedCellContent>>;
 
     /// INVALIDATION: Be careful with this, it will not track dependencies, so
     /// using it could break cache invalidation.
@@ -800,7 +799,7 @@ mod cached_task_type_tests {
 
     /// Build a `Some(RawVc::TaskOutput(..))` this value.
     fn make_this(id: u32) -> Option<RawVc> {
-        Some(RawVc::TaskOutput(
+        Some(RawVc::task_output(
             TaskId::new(id).expect("non-zero task id"),
         ))
     }

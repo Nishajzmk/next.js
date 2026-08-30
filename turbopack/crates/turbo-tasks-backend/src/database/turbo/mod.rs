@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Ok, Result};
 use smallvec::SmallVec;
 use turbo_persistence::{
-    ArcBytes, CompactConfig, DbConfig, KeyBase, StoreKey, TurboPersistence, ValueBuffer,
+    ArcBytes, CommitStats, CompactConfig, DbConfig, KeyBase, StoreKey, TurboPersistence,
+    ValueBuffer,
 };
 use turbo_tasks::{
     message_queue::{TimingEvent, TraceEvent},
@@ -16,7 +17,10 @@ use turbo_tasks::{
     turbo_tasks,
 };
 
-use crate::database::{key_value_database::KeySpace, write_batch::WriteBuffer};
+use crate::{
+    BackingStorageOptions,
+    database::{key_value_database::KeySpace, write_batch::WriteBuffer},
+};
 
 mod parallel_scheduler;
 pub(crate) use parallel_scheduler::TurboTasksParallelScheduler;
@@ -48,31 +52,22 @@ pub const COMPACT_CONFIG: CompactConfig = CompactConfig {
 
 pub struct TurboKeyValueDatabase {
     db: TurboPersistence<TurboTasksParallelScheduler, FAMILIES>,
-    is_ci: bool,
-    is_short_session: bool,
+    options: BackingStorageOptions,
     is_fresh: bool,
-    skip_compaction: bool,
 }
 
 impl TurboKeyValueDatabase {
-    pub fn new(
-        versioned_path: PathBuf,
-        is_ci: bool,
-        is_short_session: bool,
-        skip_compaction: bool,
-    ) -> Result<Self> {
+    pub fn new(versioned_path: PathBuf, options: BackingStorageOptions) -> Result<Self> {
         assert!(
-            !skip_compaction || is_short_session,
+            !options.skip_compaction || options.is_short_session,
             "skip_compaction=true requires is_short_session=true"
         );
         let db = TurboPersistence::open_with_config(versioned_path, db_config())?;
         let is_fresh = db.is_empty();
         Ok(Self {
             db,
-            is_ci,
-            is_short_session,
+            options,
             is_fresh,
-            skip_compaction,
         })
     }
 
@@ -82,10 +77,12 @@ impl TurboKeyValueDatabase {
     pub fn empty_in_memory() -> Self {
         Self {
             db: TurboPersistence::empty_in_memory_with_config(db_config()),
-            is_ci: false,
-            is_short_session: true,
+            options: BackingStorageOptions {
+                is_ci: false,
+                is_short_session: true,
+                skip_compaction: true,
+            },
             is_fresh: true,
-            skip_compaction: true,
         }
     }
 
@@ -125,11 +122,11 @@ impl TurboKeyValueDatabase {
 
     /// Triggers compaction of the database.
     ///
-    /// Returns `Ok(true)` if compaction actually merged files, `Ok(false)` if there was nothing
-    /// to compact.
-    pub fn compact(&self) -> Result<bool> {
-        if self.is_short_session || self.db.is_empty() {
-            return Ok(false);
+    /// Returns `Ok(Some(stats))` with the bytes written/deleted if compaction actually merged
+    /// files, `Ok(None)` if there was nothing to compact.
+    pub fn compact(&self) -> Result<Option<CommitStats>> {
+        if self.options.is_short_session || self.db.is_empty() {
+            return Ok(None);
         }
         do_compact(
             &self.db,
@@ -147,8 +144,8 @@ impl TurboKeyValueDatabase {
     pub fn shutdown(&self) -> Result<()> {
         // Compact the database on shutdown
         // (Avoid compacting a fresh database since we don't have any usage info yet)
-        if !self.is_fresh && !self.skip_compaction {
-            if self.is_ci {
+        if !self.is_fresh && !self.options.skip_compaction {
+            if self.options.is_ci {
                 // Fully compact in CI to reduce cache size
                 do_compact(&self.db, COMPACTION_MESSAGE, usize::MAX)?;
             } else {
@@ -169,16 +166,16 @@ fn do_compact(
     db: &TurboPersistence<TurboTasksParallelScheduler, FAMILIES>,
     message: &'static str,
     max_merge_segment_count: usize,
-) -> Result<bool> {
+) -> Result<Option<CommitStats>> {
     let start = Instant::now();
     // SystemTime for wall-clock timestamps in trace events (Instant has no
     // defined epoch so it can't be used for cross-process trace correlation).
     let wall_start = SystemTime::now();
-    let ran = db.compact(&CompactConfig {
+    let stats = db.compact(&CompactConfig {
         max_merge_segment_count,
         ..COMPACT_CONFIG
     })?;
-    if ran {
+    if let Some(stats) = stats {
         let elapsed = start.elapsed();
         // avoid spamming the event queue with information about fast operations
         if elapsed > Duration::from_secs(10) {
@@ -195,10 +192,13 @@ fn do_compact(
             "turbopack-compaction",
             wall_start_ms,
             wall_end_ms,
-            vec![],
+            serde_json::json!([
+                ["bytes_written", stats.bytes_written],
+                ["bytes_deleted", stats.bytes_deleted],
+            ]),
         )));
     }
-    Ok(ran)
+    Ok(stats)
 }
 
 pub struct TurboWriteBatch<'a> {
@@ -216,9 +216,8 @@ impl<'a> TurboWriteBatch<'a> {
         self.db.get(key_space as usize, &key)
     }
 
-    pub fn commit(self) -> Result<()> {
-        self.db.commit_write_batch(self.batch)?;
-        Ok(())
+    pub fn commit(self) -> Result<CommitStats> {
+        self.db.commit_write_batch(self.batch)
     }
 
     pub fn put(
@@ -229,6 +228,25 @@ impl<'a> TurboWriteBatch<'a> {
     ) -> Result<()> {
         self.batch
             .put(key_space as u32, key.into_static(), value.into())
+    }
+
+    /// Writes a delete (tombstone) for `key` into the write batch.
+    ///
+    /// Use [`Self::delete_value`] to remove a single mapping from a MultiValue KeySpace
+    pub fn delete(&self, key_space: KeySpace, key: WriteBuffer<'_>) -> Result<()> {
+        self.batch.delete(key_space as u32, key.into_static())
+    }
+
+    /// Writes a tombstone for a single `key` -> `value` mapping, leaving other values under `key`
+    /// intact. Only valid for `MultiValue` families (`TaskCache`).
+    pub fn delete_value(
+        &self,
+        key_space: KeySpace,
+        key: WriteBuffer<'_>,
+        value: WriteBuffer<'_>,
+    ) -> Result<()> {
+        self.batch
+            .delete_value(key_space as u32, key.into_static(), value.into())
     }
 
     /// Flushes a key space of the write batch, reducing the amount of buffered memory used.
@@ -254,8 +272,8 @@ impl KeyBase for WriteBuffer<'_> {
 }
 
 impl StoreKey for WriteBuffer<'_> {
-    fn write_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(self);
+    fn as_slice(&self) -> &[u8] {
+        self
     }
 }
 
